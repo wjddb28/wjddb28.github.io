@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>사진 규격 맞춤 도구</title>
+<meta name="description" content="이미지를 정해진 픽셀 규격에 맞게 자르거나, 여백을 채우거나, 배경을 제거하는 도구" />
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { margin: 0; background: #18181c; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useRef, useEffect, useCallback } = React;
+
+/* ---------- tiny inline icons (no external icon library needed) ---------- */
+function Icon({ d, size = 16 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+      {d}
+    </svg>
+  );
+}
+const UploadIcon = (p) => <Icon {...p} d={<><path d="M12 15V3" /><path d="m7 8 5-5 5 5" /><path d="M5 21h14" /></>} />;
+const DownloadIcon = (p) => <Icon {...p} d={<><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></>} />;
+const RotateCcwIcon = (p) => <Icon {...p} d={<><path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" /></>} />;
+const ImageOffIcon = (p) => <Icon {...p} d={<><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="9" cy="9" r="2" /><path d="m3 3 18 18" /></>} />;
+const MoveIcon = (p) => <Icon {...p} d={<><path d="M12 2v20" /><path d="M2 12h20" /><path d="m5 9-3 3 3 3" /><path d="m19 9 3 3-3 3" /><path d="m9 5-3-3-3 3" /><path d="m9 19-3 3-3-3" /></>} />;
+const Maximize2Icon = (p) => <Icon {...p} d={<><path d="M15 3h6v6" /><path d="M9 21H3v-6" /><path d="M21 3l-7 7" /><path d="M3 21l7-7" /></>} />;
+
+/* ---------- config ---------- */
+const PRESETS = [
+  { id: "a", w: 1072, h: 1448, allowCutout: true, name: "6인치" },
+  { id: "b", w: 1264, h: 1680, allowCutout: true, name: "7인치" },
+  { id: "c", w: 1072, h: 330, allowCutout: false, name: "E6 홈" },
+];
+const FILL_LABELS = { white: "흰색", black: "검정", auto: "자동맞춤" };
+const COLORS = {
+  bg: "#18181c", panel: "#212127", panelBorder: "#34343c",
+  text: "#f2f0ea", textDim: "#9a9aa3", accent: "#e8a33d",
+};
+
+/* Iterative flood fill from the canvas edges: removes background-colored
+   (or already-transparent) pixels connected to the border. */
+function removeBackground(ctx, w, h, tolerance) {
+  const imageData = ctx.getImageData(0, 0, w, h);
+  const data = imageData.data;
+  const total = w * h;
+  const corners = [[0, 0], [w - 1, 0], [0, h - 1], [w - 1, h - 1]];
+  let r = 0, g = 0, b = 0, count = 0;
+  for (const [cx, cy] of corners) {
+    const idx = (cy * w + cx) * 4;
+    if (data[idx + 3] > 10) { r += data[idx]; g += data[idx + 1]; b += data[idx + 2]; count++; }
+  }
+  if (count === 0) return;
+  r /= count; g /= count; b /= count;
+  const thresh = tolerance * 4.4;
+  const visited = new Uint8Array(total);
+  const stack = new Int32Array(total);
+  let sp = 0;
+  for (let x = 0; x < w; x++) { stack[sp++] = x; stack[sp++] = (h - 1) * w + x; }
+  for (let y = 0; y < h; y++) { stack[sp++] = y * w; stack[sp++] = y * w + w - 1; }
+  while (sp > 0) {
+    const p = stack[--sp];
+    if (visited[p]) continue;
+    visited[p] = 1;
+    const idx = p * 4;
+    const a = data[idx + 3];
+    let isBg = false;
+    if (a < 10) {
+      isBg = true;
+    } else {
+      const dr = data[idx] - r, dg = data[idx + 1] - g, db = data[idx + 2] - b;
+      const dist = Math.sqrt(dr * dr + dg * dg + db * db);
+      if (dist < thresh) { isBg = true; data[idx + 3] = 0; }
+    }
+    if (isBg) {
+      const x = p % w, y = (p / w) | 0;
+      if (x > 0 && !visited[p - 1]) stack[sp++] = p - 1;
+      if (x < w - 1 && !visited[p + 1]) stack[sp++] = p + 1;
+      if (y > 0 && !visited[p - w]) stack[sp++] = p - w;
+      if (y < h - 1 && !visited[p + w]) stack[sp++] = p + w;
+    }
+  }
+  ctx.putImageData(imageData, 0, 0);
+}
+
+const checkerStyle = {
+  backgroundColor: "#3a3a42",
+  backgroundImage:
+    "linear-gradient(45deg, #4c4c56 25%, transparent 25%), linear-gradient(-45deg, #4c4c56 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #4c4c56 75%), linear-gradient(-45deg, transparent 75%, #4c4c56 75%)",
+  backgroundSize: "16px 16px",
+  backgroundPosition: "0 0, 0 8px, 8px -8px, -8px 0px",
+};
+
+function PhotoResizer() {
+  const [imgObj, setImgObj] = useState(null);
+  const [fileName, setFileName] = useState("");
+  const [presetId, setPresetId] = useState("a");
+  const [fillMode, setFillMode] = useState("white");
+  const [cutout, setCutout] = useState(false);
+  const [tolerance, setTolerance] = useState(30);
+  const [scale, setScale] = useState(1);
+  const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const [dragOver, setDragOver] = useState(false);
+  const [dragging, setDragging] = useState(false);
+
+  const canvasRef = useRef(null);
+  const dragRef = useRef({ startX: 0, startY: 0, offX: 0, offY: 0, ratio: 1 });
+
+  const preset = PRESETS.find((p) => p.id === presetId);
+  const useCutout = cutout && preset.allowCutout;
+
+  const loadFile = (file) => {
+    if (!file || !file.type.startsWith("image/")) return;
+    setFileName(file.name);
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const img = new Image();
+      img.onload = () => setImgObj(img);
+      img.src = ev.target.result;
+    };
+    reader.readAsDataURL(file);
+  };
+
+  useEffect(() => {
+    if (!imgObj) return;
+    if (fillMode === "auto") {
+      setScale(Math.max(preset.w / imgObj.width, preset.h / imgObj.height));
+    } else {
+      setScale(1);
+    }
+    setOffset({ x: 0, y: 0 });
+  }, [imgObj, presetId, fillMode]);
+
+  useEffect(() => {
+    if (!preset.allowCutout && cutout) setCutout(false);
+  }, [preset, cutout]);
+
+  const draw = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const { w, h } = preset;
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, w, h);
+    if (!imgObj) return;
+    if (!useCutout && fillMode !== "auto") {
+      ctx.fillStyle = fillMode === "white" ? "#ffffff" : "#000000";
+      ctx.fillRect(0, 0, w, h);
+    }
+    const drawW = imgObj.width * scale;
+    const drawH = imgObj.height * scale;
+    const drawX = (w - drawW) / 2 + offset.x;
+    const drawY = (h - drawH) / 2 + offset.y;
+    ctx.drawImage(imgObj, drawX, drawY, drawW, drawH);
+    if (useCutout) removeBackground(ctx, w, h, tolerance);
+  }, [imgObj, preset, fillMode, useCutout, tolerance, scale, offset]);
+
+  useEffect(() => {
+    const t = setTimeout(draw, 60);
+    return () => clearTimeout(t);
+  }, [draw]);
+
+  const beginDrag = (clientX, clientY) => {
+    if (!imgObj) return;
+    const rect = canvasRef.current.getBoundingClientRect();
+    dragRef.current = { startX: clientX, startY: clientY, offX: offset.x, offY: offset.y, ratio: canvasRef.current.width / rect.width };
+    setDragging(true);
+  };
+  const moveDrag = (clientX, clientY) => {
+    const d = dragRef.current;
+    setOffset({ x: d.offX + (clientX - d.startX) * d.ratio, y: d.offY + (clientY - d.startY) * d.ratio });
+  };
+
+  const handleDownload = () => {
+    const canvas = canvasRef.current;
+    if (!canvas || !imgObj) return;
+    canvas.toBlob((blob) => {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const suffix = useCutout ? "transparent" : fillMode;
+      a.href = url;
+      a.download = `resized_${preset.w}x${preset.h}_${suffix}.png`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }, "image/png");
+  };
+
+  return (
+    <div
+      style={{ backgroundColor: COLORS.bg, color: COLORS.text, minHeight: "100%" }}
+      className="w-full min-h-screen font-sans"
+      onMouseUp={() => setDragging(false)}
+      onMouseLeave={() => setDragging(false)}
+      onMouseMove={(e) => dragging && moveDrag(e.clientX, e.clientY)}
+    >
+      <div className="max-w-5xl mx-auto px-5 py-8">
+        <div className="mb-7">
+          <h1 className="text-xl tracking-tight" style={{ color: COLORS.text }}>사진 규격 맞춤 도구</h1>
+          <p className="text-sm mt-1" style={{ color: COLORS.textDim }}>이미지를 정해진 픽셀 규격에 맞게 자르거나 여백을 채웁니다.</p>
+        </div>
+
+        <div className="flex flex-col md:flex-row gap-6">
+          <div className="md:w-72 shrink-0 rounded-lg p-4 space-y-6" style={{ backgroundColor: COLORS.panel, border: `1px solid ${COLORS.panelBorder}` }}>
+            <div>
+              <div
+                onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+                onDragLeave={() => setDragOver(false)}
+                onDrop={(e) => { e.preventDefault(); setDragOver(false); loadFile(e.dataTransfer.files?.[0]); }}
+                className="rounded-md py-6 px-3 text-center cursor-pointer transition-colors"
+                style={{ border: `1.5px dashed ${dragOver ? COLORS.accent : COLORS.panelBorder}`, backgroundColor: dragOver ? "rgba(232,163,61,0.06)" : "transparent" }}
+                onClick={() => document.getElementById("photo-resizer-input").click()}
+              >
+                <UploadIcon size={18} style={{ margin: "0 auto 8px" }} />
+                <div className="text-sm" style={{ color: COLORS.text }}>{imgObj ? "다른 이미지로 교체" : "이미지 업로드"}</div>
+                <div className="text-xs mt-1" style={{ color: COLORS.textDim }}>클릭 또는 드래그 앤 드롭</div>
+                <input id="photo-resizer-input" type="file" accept="image/*" className="hidden" onChange={(e) => loadFile(e.target.files?.[0])} />
+              </div>
+              {fileName && <div className="text-xs mt-2 truncate font-mono" style={{ color: COLORS.textDim }}>{fileName} · {imgObj?.width}×{imgObj?.height}</div>}
+            </div>
+
+            <div>
+              <div className="text-xs mb-2" style={{ color: COLORS.textDim }}>출력 규격</div>
+              <div className="space-y-1.5">
+                {PRESETS.map((p) => (
+                  <button key={p.id} onClick={() => setPresetId(p.id)}
+                    className="w-full flex items-center justify-between px-3 py-2 rounded-md text-sm transition-colors"
+                    style={{ backgroundColor: presetId === p.id ? "rgba(232,163,61,0.12)" : "transparent", border: `1px solid ${presetId === p.id ? COLORS.accent : COLORS.panelBorder}`, color: presetId === p.id ? COLORS.accent : COLORS.text }}>
+                    <span className="font-mono">{p.w} × {p.h}</span>
+                    <span className="text-xs" style={{ color: presetId === p.id ? COLORS.accent : COLORS.textDim }}>{p.name}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <label className="flex items-center justify-between text-sm" style={{ color: preset.allowCutout ? COLORS.text : COLORS.textDim, opacity: preset.allowCutout ? 1 : 0.5 }}>
+                <span className="flex items-center gap-1.5"><ImageOffIcon size={14} /> 배경 제거 (누끼)</span>
+                <input type="checkbox" checked={useCutout} disabled={!preset.allowCutout} onChange={(e) => setCutout(e.target.checked)} />
+              </label>
+              {!preset.allowCutout && <div className="text-xs mt-1" style={{ color: COLORS.textDim }}>이 규격은 배경 제거를 지원하지 않습니다.</div>}
+              {useCutout && (
+                <div className="mt-3">
+                  <div className="flex justify-between text-xs mb-1" style={{ color: COLORS.textDim }}>
+                    <span>배경 감지 민감도</span><span className="font-mono">{tolerance}</span>
+                  </div>
+                  <input type="range" min="5" max="80" value={tolerance} onChange={(e) => setTolerance(Number(e.target.value))} className="w-full" />
+                  <div className="text-xs mt-1" style={{ color: COLORS.textDim }}>배경이 단색에 가까울수록 결과가 깨끗합니다.</div>
+                </div>
+              )}
+            </div>
+
+            {!useCutout && (
+              <div>
+                <div className="text-xs mb-2" style={{ color: COLORS.textDim }}>여백 처리</div>
+                <div className="flex gap-2">
+                  {["white", "black", "auto"].map((c) => (
+                    <button key={c} onClick={() => setFillMode(c)}
+                      className="flex-1 flex flex-col items-center justify-center gap-1.5 px-2 py-2 rounded-md text-xs"
+                      style={{ border: `1px solid ${fillMode === c ? COLORS.accent : COLORS.panelBorder}`, color: fillMode === c ? COLORS.accent : COLORS.text }}>
+                      {c === "auto" ? <Maximize2Icon size={13} /> : <span className="inline-block rounded-full" style={{ width: 13, height: 13, backgroundColor: c === "white" ? "#ffffff" : "#000000", border: c === "white" ? "1px solid #888" : "none" }} />}
+                      {FILL_LABELS[c]}
+                    </button>
+                  ))}
+                </div>
+                <div className="text-xs mt-2" style={{ color: COLORS.textDim }}>
+                  {fillMode === "auto" ? "이미지를 확대해 캔버스 전체를 채웁니다 (여백 없음)." : "이미지가 캔버스보다 작으면 이 색으로 여백을 채웁니다."}
+                </div>
+              </div>
+            )}
+
+            <div>
+              <div className="flex justify-between text-xs mb-1" style={{ color: COLORS.textDim }}>
+                <span className="flex items-center gap-1.5"><MoveIcon size={12} /> 확대 / 축소</span>
+                <span className="font-mono">{Math.round(scale * 100)}%</span>
+              </div>
+              <input type="range"
+                min={fillMode === "auto" && !useCutout && imgObj ? Math.round(Math.max(preset.w / imgObj.width, preset.h / imgObj.height) * 100) : 20}
+                max="300" value={Math.round(scale * 100)} onChange={(e) => setScale(Number(e.target.value) / 100)} className="w-full" disabled={!imgObj} />
+              <div className="flex items-center justify-between mt-2">
+                <div className="text-xs" style={{ color: COLORS.textDim }}>캔버스를 드래그해 위치를 조정하세요.</div>
+                <button onClick={() => {
+                  if (fillMode === "auto" && imgObj) setScale(Math.max(preset.w / imgObj.width, preset.h / imgObj.height));
+                  else setScale(1);
+                  setOffset({ x: 0, y: 0 });
+                }} className="flex items-center gap-1 text-xs px-2 py-1 rounded" style={{ color: COLORS.textDim, border: `1px solid ${COLORS.panelBorder}` }}>
+                  <RotateCcwIcon size={12} /> 초기화
+                </button>
+              </div>
+            </div>
+
+            <button onClick={handleDownload} disabled={!imgObj}
+              className="w-full flex items-center justify-center gap-2 py-2.5 rounded-md text-sm font-medium transition-opacity"
+              style={{ backgroundColor: COLORS.accent, color: "#18181c", opacity: imgObj ? 1 : 0.4, cursor: imgObj ? "pointer" : "default" }}>
+              <DownloadIcon size={16} /> PNG 다운로드
+            </button>
+          </div>
+
+          <div className="flex-1 min-w-0">
+            <div className="rounded-lg flex items-center justify-center overflow-hidden" style={{ height: "min(65vh, 620px)", backgroundColor: COLORS.panel, border: `1px solid ${COLORS.panelBorder}` }}>
+              {!imgObj ? (
+                <div className="text-center px-6"><div className="text-sm" style={{ color: COLORS.textDim }}>이미지를 업로드하면 미리보기가 여기에 표시됩니다.</div></div>
+              ) : (
+                <div style={useCutout ? checkerStyle : undefined} className="rounded-sm">
+                  <canvas ref={canvasRef}
+                    style={{ maxWidth: "min(90vw, 620px)", maxHeight: "min(60vh, 600px)", width: "auto", height: "auto", display: "block", cursor: dragging ? "grabbing" : "grab" }}
+                    onMouseDown={(e) => beginDrag(e.clientX, e.clientY)}
+                    onTouchStart={(e) => { const t = e.touches[0]; beginDrag(t.clientX, t.clientY); }}
+                    onTouchMove={(e) => { const t = e.touches[0]; moveDrag(t.clientX, t.clientY); }}
+                    onTouchEnd={() => setDragging(false)}
+                  />
+                </div>
+              )}
+            </div>
+            <div className="text-xs mt-2 font-mono" style={{ color: COLORS.textDim }}>
+              출력 크기: {preset.w} × {preset.h}px ({preset.name}){useCutout ? " · 배경 투명" : ` · ${FILL_LABELS[fillMode]}`}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<PhotoResizer />);
+</script>
+</body>
+</html>
